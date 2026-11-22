@@ -78,7 +78,7 @@ class CourseSearchTool(Tool):
             filter_info = ""
             if course_name:
                 filter_info += f" in course '{course_name}'"
-            if lesson_number:
+            if lesson_number is not None:
                 filter_info += f" in lesson {lesson_number}"
             return f"No relevant content found{filter_info}."
         
@@ -207,7 +207,11 @@ class ToolManager:
         if tool_name not in self.tools:
             return f"Tool '{tool_name}' not found"
         
-        return self.tools[tool_name].execute(**kwargs)
+        try:
+            return self.tools[tool_name].execute(**kwargs)
+        except Exception as e:
+            # Report failures to Claude as a tool_result instead of crashing the request
+            return f"Tool '{tool_name}' failed: {e}"
     
     def get_last_sources(self) -> list:
         """Get sources from the last search operation"""

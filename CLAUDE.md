@@ -22,7 +22,11 @@ cd backend && uv run uvicorn app:app --reload --port 8000
 
 **Environment**: requires a `.env` file in the repo root with `ANTHROPIC_API_KEY=...` (see `.env.example`). Loaded via `python-dotenv` in `backend/config.py`.
 
-There is currently no test suite, linter, or type-checker configured in this repo.
+**Run tests** (pytest, configured in `pyproject.toml`; tests live in `backend/tests/`, Claude API is mocked):
+```bash
+uv run pytest
+```
+There is no linter or type-checker configured.
 
 ## Architecture
 

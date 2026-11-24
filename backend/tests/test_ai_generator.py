@@ -1,4 +1,5 @@
 """Tests that AIGenerator calls tools (CourseSearchTool etc.) correctly."""
+import copy
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -109,3 +110,196 @@ def test_tool_exception_does_not_crash_request(generator, mock_vector_store):
 
     out = generator.generate_response("q", tools=tm.get_tool_definitions(), tool_manager=tm)
     assert out == "Sorry, search failed."
+
+
+# --------------------------------------------------------------------------- #
+# Sequential tool calling (up to 2 rounds)
+# --------------------------------------------------------------------------- #
+def script(generator, responses):
+    """Feed scripted responses; return a list of deep-copied kwargs, one per API call.
+
+    Snapshots are needed because the messages list is mutated between rounds.
+    """
+    calls = []
+    queue = list(responses)
+
+    def fake_create(**kwargs):
+        calls.append(copy.deepcopy(kwargs))
+        return queue.pop(0)
+
+    generator.client.messages.create.side_effect = fake_create
+    return calls
+
+
+def tool_round(name, input, id):
+    return make_response([tool_use_block(name, input, id)], stop_reason="tool_use")
+
+
+def test_two_round_chain_makes_three_calls(generator):
+    calls = script(generator, [
+        tool_round("get_course_outline", {"course_title": "X"}, "t1"),
+        tool_round("search_course_content", {"query": "Lesson four topic"}, "t2"),
+        make_response([text_block("Course Y covers it.")]),
+    ])
+    tm = MagicMock()
+    tm.execute_tool.side_effect = ["outline: lesson 4 = Lesson four topic", "Course Y chunk"]
+
+    out = generator.generate_response("same topic as lesson 4 of X?", tools=TOOLS, tool_manager=tm)
+
+    assert out == "Course Y covers it."
+    assert [c.args for c in tm.execute_tool.call_args_list] == [("get_course_outline",), ("search_course_content",)]
+    assert tm.execute_tool.call_args_list[1].kwargs == {"query": "Lesson four topic"}
+    assert len(calls) == 3
+    assert "tools" in calls[0] and "tools" in calls[1]
+    assert "tools" not in calls[2]
+
+
+def test_context_preserved_between_rounds(generator):
+    calls = script(generator, [
+        tool_round("get_course_outline", {"course_title": "X"}, "t1"),
+        tool_round("search_course_content", {"query": "q"}, "t2"),
+        make_response([text_block("done")]),
+    ])
+    tm = MagicMock()
+    tm.execute_tool.side_effect = ["r1", "r2"]
+
+    generator.generate_response("question", tools=TOOLS, tool_manager=tm)
+
+    assert len(calls[1]["messages"]) == 3
+    final = calls[2]["messages"]
+    assert [m["role"] for m in final] == ["user", "assistant", "user", "assistant", "user"]
+    assert final[0]["content"] == "question"
+    assert final[2]["content"][0]["tool_use_id"] == "t1"
+    assert final[2]["content"][0]["content"] == "r1"
+    assert final[4]["content"][0]["tool_use_id"] == "t2"
+    assert final[4]["content"][0]["content"] == "r2"
+
+
+def test_second_call_still_has_tools_after_single_round(generator):
+    calls = script(generator, [
+        tool_round("search_course_content", {"query": "q"}, "t1"),
+        make_response([text_block("answer")]),
+    ])
+    tm = MagicMock()
+    tm.execute_tool.return_value = "chunk"
+
+    assert generator.generate_response("q", tools=TOOLS, tool_manager=tm) == "answer"
+    assert len(calls) == 2
+    assert calls[1]["tools"] == TOOLS
+
+
+def test_cap_at_two_rounds(generator):
+    calls = script(generator, [
+        tool_round("search_course_content", {"query": "a"}, "t1"),
+        tool_round("search_course_content", {"query": "b"}, "t2"),
+        make_response([text_block("final answer")]),
+    ])
+    tm = MagicMock()
+    tm.execute_tool.return_value = "chunk"
+
+    out = generator.generate_response("q", tools=TOOLS, tool_manager=tm)
+
+    assert out == "final answer"
+    assert tm.execute_tool.call_count == 2
+    assert len(calls) == 3
+    assert "tools" not in calls[2]
+
+
+def test_tool_failure_stops_loop_and_flags_error(generator, mock_vector_store):
+    mock_vector_store.search.side_effect = RuntimeError("db down")
+    tm = ToolManager()
+    tm.register_tool(CourseSearchTool(mock_vector_store))
+    calls = script(generator, [
+        tool_round("search_course_content", {"query": "q"}, "t1"),
+        make_response([text_block("Search failed, sorry.")]),
+    ])
+
+    out = generator.generate_response("q", tools=tm.get_tool_definitions(), tool_manager=tm)
+
+    assert out == "Search failed, sorry."
+    assert len(calls) == 2
+    assert "tools" not in calls[1]
+    result = calls[1]["messages"][-1]["content"][0]
+    assert result["tool_use_id"] == "t1"
+    assert result["is_error"] is True
+    assert "db down" in result["content"]
+
+
+def test_raised_exception_from_tool_manager_is_reported(generator):
+    calls = script(generator, [
+        tool_round("search_course_content", {"query": "q"}, "t1"),
+        make_response([text_block("sorry")]),
+    ])
+    tm = MagicMock()
+    tm.execute_tool.side_effect = RuntimeError("boom")
+
+    assert generator.generate_response("q", tools=TOOLS, tool_manager=tm) == "sorry"
+    assert len(calls) == 2 and "tools" not in calls[1]
+    assert calls[1]["messages"][-1]["content"][0]["is_error"] is True
+
+
+def test_failure_in_second_round_stops_cleanly(generator):
+    calls = script(generator, [
+        tool_round("get_course_outline", {"course_title": "X"}, "t1"),
+        tool_round("search_course_content", {"query": "q"}, "t2"),
+        make_response([text_block("partial answer")]),
+    ])
+    tm = MagicMock()
+    tm.execute_tool.side_effect = ["outline", "Tool 'search_course_content' failed: db down"]
+
+    out = generator.generate_response("q", tools=TOOLS, tool_manager=tm)
+
+    assert out == "partial answer"
+    assert len(calls) == 3 and "tools" not in calls[2]
+    first, second = calls[2]["messages"][2]["content"][0], calls[2]["messages"][4]["content"][0]
+    assert "is_error" not in first
+    assert second["is_error"] is True
+
+
+def test_parallel_tool_use_blocks_return_in_one_message(generator):
+    calls = script(generator, [
+        make_response([
+            tool_use_block("get_course_outline", {"course_title": "A"}, "t1"),
+            tool_use_block("get_course_outline", {"course_title": "B"}, "t2"),
+        ], stop_reason="tool_use"),
+        make_response([text_block("compared")]),
+    ])
+    tm = MagicMock()
+    tm.execute_tool.side_effect = ["A outline", "B outline"]
+
+    assert generator.generate_response("compare A and B", tools=TOOLS, tool_manager=tm) == "compared"
+    results = calls[1]["messages"][-1]["content"]
+    assert [r["tool_use_id"] for r in results] == ["t1", "t2"]
+    assert [r["content"] for r in results] == ["A outline", "B outline"]
+
+
+def test_empty_final_text_returns_fallback(generator):
+    script(generator, [
+        tool_round("search_course_content", {"query": "a"}, "t1"),
+        tool_round("search_course_content", {"query": "b"}, "t2"),
+        make_response([]),
+    ])
+    tm = MagicMock()
+    tm.execute_tool.return_value = "chunk"
+
+    out = generator.generate_response("q", tools=TOOLS, tool_manager=tm)
+    assert out == AIGenerator.EMPTY_FALLBACK
+
+
+def test_history_in_system_prompt_on_every_round(generator):
+    calls = script(generator, [
+        tool_round("search_course_content", {"query": "q"}, "t1"),
+        tool_round("search_course_content", {"query": "q2"}, "t2"),
+        make_response([text_block("ok")]),
+    ])
+    tm = MagicMock()
+    tm.execute_tool.return_value = "chunk"
+
+    generator.generate_response("q", conversation_history="User: hi", tools=TOOLS, tool_manager=tm)
+
+    assert all("Previous conversation:\nUser: hi" in c["system"] for c in calls)
+
+
+def test_system_prompt_allows_two_sequential_calls():
+    assert "One tool call per query maximum" not in AIGenerator.SYSTEM_PROMPT
+    assert "2 sequential tool calls" in AIGenerator.SYSTEM_PROMPT

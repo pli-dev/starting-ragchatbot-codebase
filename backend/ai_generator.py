@@ -1,5 +1,5 @@
 import anthropic
-from typing import List, Optional, Dict, Any
+from typing import List, Optional
 
 class AIGenerator:
     """Handles interactions with Anthropic's Claude API for generating responses"""
@@ -11,7 +11,9 @@ Tool Usage:
 - **search_course_content**: Use **only** for questions about specific course content or detailed educational materials
 - **get_course_outline**: Use for questions about a course's outline, structure, syllabus, or which lessons it contains
   - When answering, always include the course title, the course link, and the number and title of **every** lesson (complete list, no truncation)
-- **One tool call per query maximum**
+- **Up to 2 sequential tool calls per query**, each in its own step so you can reason about earlier results
+  - Make a second call only when it depends on the first result (e.g. get a course outline, then search using a lesson title)
+  - Never repeat a call that already failed or returned nothing; after your tool use, answer directly
 - Synthesize tool results into accurate, fact-based responses
 - If a tool yields no results, state this clearly without offering alternatives
 
@@ -31,6 +33,9 @@ All responses must be:
 Provide only the direct answer to what was asked.
 """
     
+    MAX_TOOL_ROUNDS = 2
+    EMPTY_FALLBACK = "I wasn't able to complete that request."
+
     def __init__(self, api_key: str, model: str):
         self.client = anthropic.Anthropic(api_key=api_key)
         self.model = model
@@ -65,27 +70,29 @@ Provide only the direct answer to what was asked.
             else self.SYSTEM_PROMPT
         )
         
-        # Prepare API call parameters efficiently
-        api_params = {
-            **self.base_params,
-            "messages": [{"role": "user", "content": query}],
-            "system": system_content
-        }
-        
-        # Add tools if available
-        if tools:
-            api_params["tools"] = tools
-            api_params["tool_choice"] = {"type": "auto"}
-        
-        # Get response from Claude
-        response = self.client.messages.create(**api_params)
-        
-        # Handle tool execution if needed
-        if response.stop_reason == "tool_use" and tool_manager:
-            return self._handle_tool_execution(response, api_params, tool_manager)
-        
-        # Return direct response
-        return self._extract_text(response)
+        messages = [{"role": "user", "content": query}]
+        base = {**self.base_params, "system": system_content}
+
+        # Up to MAX_TOOL_ROUNDS rounds, each a separate API request with tools attached
+        for _ in range(self.MAX_TOOL_ROUNDS):
+            request = {**base, "messages": messages}
+            if tools:
+                request["tools"] = tools
+                request["tool_choice"] = {"type": "auto"}
+            response = self.client.messages.create(**request)
+
+            if response.stop_reason != "tool_use" or not tool_manager:
+                return self._extract_text(response)
+
+            messages.append({"role": "assistant", "content": response.content})
+            results, failed = self._run_tools(response, tool_manager)
+            messages.append({"role": "user", "content": results})
+            if failed:
+                break
+
+        # Rounds exhausted or a tool failed: force a text answer by omitting tools
+        final = self.client.messages.create(**base, messages=messages)
+        return self._extract_text(final) or self.EMPTY_FALLBACK
 
     @staticmethod
     def _extract_text(response) -> str:
@@ -93,51 +100,28 @@ Provide only the direct answer to what was asked.
         return "".join(
             block.text for block in response.content if block.type == "text"
         ).strip()
-    
-    def _handle_tool_execution(self, initial_response, base_params: Dict[str, Any], tool_manager):
-        """
-        Handle execution of tool calls and get follow-up response.
-        
-        Args:
-            initial_response: The response containing tool use requests
-            base_params: Base API parameters
-            tool_manager: Manager to execute tools
-            
-        Returns:
-            Final response text after tool execution
-        """
-        # Start with existing messages
-        messages = base_params["messages"].copy()
-        
-        # Add AI's tool use response
-        messages.append({"role": "assistant", "content": initial_response.content})
-        
-        # Execute all tool calls and collect results
-        tool_results = []
-        for content_block in initial_response.content:
-            if content_block.type == "tool_use":
-                tool_result = tool_manager.execute_tool(
-                    content_block.name, 
-                    **content_block.input
-                )
-                
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": content_block.id,
-                    "content": tool_result
-                })
-        
-        # Add tool results as single message
-        if tool_results:
-            messages.append({"role": "user", "content": tool_results})
-        
-        # Prepare final API call without tools
-        final_params = {
-            **self.base_params,
-            "messages": messages,
-            "system": base_params["system"]
-        }
-        
-        # Get final response
-        final_response = self.client.messages.create(**final_params)
-        return self._extract_text(final_response)
+
+    @staticmethod
+    def _is_error_result(result) -> bool:
+        """ToolManager reports failures as strings rather than raising."""
+        return isinstance(result, str) and result.startswith("Tool '") and (
+            "' failed:" in result or result.endswith("' not found")
+        )
+
+    def _run_tools(self, response, tool_manager):
+        """Execute every tool_use block; return (tool_result blocks, any_failed)."""
+        results, failed = [], False
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            try:
+                output = tool_manager.execute_tool(block.name, **block.input)
+                is_error = self._is_error_result(output)
+            except Exception as e:
+                output, is_error = f"Tool '{block.name}' failed: {e}", True
+            result = {"type": "tool_result", "tool_use_id": block.id, "content": output}
+            if is_error:
+                result["is_error"] = True
+                failed = True
+            results.append(result)
+        return results, failed

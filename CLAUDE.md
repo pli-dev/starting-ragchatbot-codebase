@@ -37,8 +37,8 @@ This is a RAG chatbot over course transcripts, but retrieval is **not a fixed pi
 `frontend/script.js` → `POST /api/query` (`backend/app.py`) → `RAGSystem.query()` (`backend/rag_system.py`) → `AIGenerator.generate_response()` (`backend/ai_generator.py`), which calls Claude with the `search_course_content` tool attached (`tool_choice: auto`).
 
 - If Claude answers without using the tool, that's returned directly.
-- If Claude emits a `tool_use` block, `ToolManager.execute_tool()` (`backend/search_tools.py`) runs `CourseSearchTool.execute()`, results are appended as a `tool_result` message, and a **second** `messages.create()` call (without tools) produces the final synthesized answer. This two-call pattern only happens on the search path.
-- The system prompt (in `ai_generator.py`) caps Claude to **one search per query** — it cannot chain searches to refine results.
+- If Claude emits a `tool_use` block, `ToolManager.execute_tool()` (`backend/search_tools.py`) runs `CourseSearchTool.execute()`, results are appended as a `tool_result` message, and Claude may chain a second tool call, then a final call (without tools) produces the synthesized answer. This multi-call pattern only happens on the tool path.
+- The system prompt (in `ai_generator.py`) allows up to **2 sequential tool rounds per query** (each a separate API request with tools attached, e.g. outline then search). After the 2nd round, or if a tool fails, a final tools-less call produces the answer, so a query makes at most 3 `messages.create()` calls. If both rounds search, `last_sources` reflects only the last search.
 
 Sources surfaced in the UI come from `CourseSearchTool.last_sources`, tracked as a side effect of formatting search results, fetched via `ToolManager.get_last_sources()`, and reset after each query — this is stateful and not thread-safe across concurrent requests.
 
